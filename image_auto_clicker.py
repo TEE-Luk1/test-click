@@ -1,0 +1,756 @@
+# -*- coding: utf-8 -*-
+"""
+圖像偵測自動點擊器 (Image Detect Auto Clicker)
+--------------------------------------------------
+功能：
+  1. 自由框選偵測範圍（支援多螢幕）
+  2. 直接從畫面框選擷取判定圖示，或載入既有圖片
+  3. 可調相似度閾值，執行時即時顯示比對分數
+  4. 點擊方式自訂：按鍵 / 單擊 / 雙擊 / 按住 / 鍵盤按鍵、位置偏移、次數、間隔
+  5. 找不到時待機等待，直到圖示出現
+  6. 冷卻、等待消失（邊緣觸發）、逾時保護
+  7. 全域熱鍵啟動 / 停止
+
+執行前請先安裝：
+    pip install opencv-python mss pyautogui pillow numpy keyboard
+"""
+
+import ctypes
+import sys
+import os
+import json
+import time
+import threading
+import random
+import queue
+
+# ---------------------------------------------------------------
+# DPI 感知必須在建立任何視窗之前設定，否則在 125%/150% 縮放的螢幕上
+# 截圖座標與滑鼠座標會不一致，導致點擊固定偏移。
+# ---------------------------------------------------------------
+def _set_dpi_aware():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+if sys.platform == "win32":
+    _set_dpi_aware()
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import numpy as np
+import cv2
+import mss
+import pyautogui
+from PIL import Image, ImageTk
+
+try:
+    import keyboard
+    HAS_KEYBOARD = True
+except Exception:
+    HAS_KEYBOARD = False
+
+pyautogui.PAUSE = 0          # 節奏由我們自己控制
+pyautogui.FAILSAFE = True    # 滑鼠移到螢幕左上角可強制中止
+
+APP_TITLE = "圖像偵測自動點擊器"
+CONFIG_FILE = "clicker_config.json"
+TEMPLATE_FILE = "template.png"
+
+
+# ===============================================================
+#  螢幕框選工具
+# ===============================================================
+class ScreenSelector:
+    """
+    以凍結的整個虛擬桌面截圖為底，讓使用者拖曳框選一塊區域。
+    回傳 (region_dict, cropped_bgr_ndarray)，取消則回傳 (None, None)。
+
+    使用凍結截圖而非半透明視窗的好處：
+      - 畫面不會在框選過程中變動
+      - 裁切出來的模板與執行時 mss 擷取的畫面完全同源，色彩與解析度一致
+    """
+
+    def __init__(self, master, hint=""):
+        self.master = master
+        self.hint = hint
+        self.result_region = None
+        self.result_image = None
+
+    def select(self):
+        with mss.mss() as sct:
+            virt = sct.monitors[0]          # monitors[0] = 所有螢幕的聯集
+            shot = sct.grab(virt)
+
+        frame_bgra = np.array(shot)                       # (H, W, 4) BGRA
+        self.frame_bgr = frame_bgra[:, :, :3].copy()
+        rgb = cv2.cvtColor(self.frame_bgr, cv2.COLOR_BGR2RGB)
+
+        self.vx, self.vy = virt["left"], virt["top"]
+        vw, vh = virt["width"], virt["height"]
+
+        self.top = tk.Toplevel(self.master)
+        self.top.overrideredirect(True)
+        self.top.geometry(f"{vw}x{vh}+{self.vx}+{self.vy}")
+        self.top.attributes("-topmost", True)
+        self.top.configure(cursor="crosshair")
+
+        self.canvas = tk.Canvas(self.top, width=vw, height=vh,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack()
+
+        self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+
+        # 壓暗底圖，讓框選區域更明顯
+        self.canvas.create_rectangle(0, 0, vw, vh, fill="black",
+                                     stipple="gray50", outline="")
+
+        if self.hint:
+            self.canvas.create_text(
+                vw // 2, 40, text=self.hint, fill="#FFD24A",
+                font=("Microsoft JhengHei", 18, "bold"))
+
+        self.start = None
+        self.rect_id = None
+        self.size_id = None
+
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.top.bind("<Escape>", lambda e: self._cancel())
+
+        self.top.focus_force()
+        self.top.grab_set()
+        self.master.wait_window(self.top)
+        return self.result_region, self.result_image
+
+    # ---------- 事件 ----------
+    def _on_press(self, e):
+        self.start = (e.x, e.y)
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+        self.rect_id = self.canvas.create_rectangle(
+            e.x, e.y, e.x, e.y, outline="#00E5FF", width=2)
+
+    def _on_drag(self, e):
+        if not self.start:
+            return
+        x0, y0 = self.start
+        self.canvas.coords(self.rect_id, x0, y0, e.x, e.y)
+        if self.size_id:
+            self.canvas.delete(self.size_id)
+        self.size_id = self.canvas.create_text(
+            e.x + 55, e.y + 14,
+            text=f"{abs(e.x - x0)} x {abs(e.y - y0)}",
+            fill="#00E5FF", font=("Consolas", 12, "bold"))
+
+    def _on_release(self, e):
+        if not self.start:
+            return
+        x0, y0 = self.start
+        x1, y1 = e.x, e.y
+        left, top = min(x0, x1), min(y0, y1)
+        w, h = abs(x1 - x0), abs(y1 - y0)
+
+        if w < 5 or h < 5:                    # 誤點，忽略
+            self._cancel()
+            return
+
+        self.result_region = {"left": self.vx + left, "top": self.vy + top,
+                              "width": w, "height": h}
+        self.result_image = self.frame_bgr[top:top + h, left:left + w].copy()
+        self.top.destroy()
+
+    def _cancel(self):
+        self.result_region = None
+        self.result_image = None
+        self.top.destroy()
+
+
+# ===============================================================
+#  偵測 / 點擊工作執行緒
+# ===============================================================
+class ClickWorker(threading.Thread):
+    def __init__(self, cfg, template_bgr, status, lock, logq, on_finish):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
+        self.th, self.tw = self.template_gray.shape[:2]
+        self.status = status
+        self.lock = lock
+        self.logq = logq
+        self.on_finish = on_finish
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+
+    # ---------- 內部工具 ----------
+    def _log(self, msg):
+        self.logq.put(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+    def _set(self, **kw):
+        with self.lock:
+            self.status.update(kw)
+
+    def _match(self, sct, region):
+        shot = np.array(sct.grab(region))
+        gray = cv2.cvtColor(shot[:, :, :3], cv2.COLOR_BGR2GRAY)
+        if gray.shape[0] < self.th or gray.shape[1] < self.tw:
+            return -1.0, (0, 0)
+        res = cv2.matchTemplate(gray, self.template_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        return float(max_val), max_loc
+
+    def _do_action(self, cx, cy):
+        c = self.cfg
+        jitter = c["jitter"]
+        origin = pyautogui.position() if c["restore_mouse"] else None
+
+        for i in range(max(1, c["click_count"])):
+            if self.stop_event.is_set():
+                return
+            x, y = cx, cy
+            if jitter:
+                x += random.randint(-2, 2)
+                y += random.randint(-2, 2)
+
+            act = c["action"]
+            if act == "單擊":
+                pyautogui.click(x, y, button=c["button"])
+            elif act == "雙擊":
+                pyautogui.doubleClick(x, y, button=c["button"])
+            elif act == "按住放開":
+                pyautogui.moveTo(x, y)
+                pyautogui.mouseDown(button=c["button"])
+                time.sleep(max(0.0, c["hold_sec"]))
+                pyautogui.mouseUp(button=c["button"])
+            elif act == "按鍵盤":
+                key = (c["key"] or "").strip()
+                if key:
+                    pyautogui.press(key)
+
+            if i < c["click_count"] - 1:
+                gap = c["click_interval"] / 1000.0
+                if jitter:
+                    gap *= random.uniform(0.7, 1.3)
+                time.sleep(max(0.0, gap))
+
+        if origin:
+            pyautogui.moveTo(origin[0], origin[1])
+
+    # ---------- 主迴圈 ----------
+    def run(self):
+        c = self.cfg
+        region = c["region"]
+        threshold = c["threshold"]
+        scan = max(0.01, c["scan_interval"] / 1000.0)
+        cooldown = max(0.0, c["cooldown"])
+        timeout = c["timeout"]
+        triggers = 0
+        wait_start = time.time()
+
+        self._log("開始監控，等待圖示出現…")
+        self._set(state="搜尋中", count=0)
+
+        try:
+            with mss.mss() as sct:
+                while not self.stop_event.is_set():
+                    # --- 逾時保護 ---
+                    if timeout > 0 and (time.time() - wait_start) > timeout:
+                        self._log(f"等待超過 {timeout} 秒，自動停止。")
+                        break
+
+                    score, loc = self._match(sct, region)
+                    self._set(score=score,
+                              waited=time.time() - wait_start)
+
+                    if score >= threshold:
+                        # --- 換算成絕對螢幕座標 ---
+                        cx = region["left"] + loc[0] + self.tw // 2 + c["offset_x"]
+                        cy = region["top"] + loc[1] + self.th // 2 + c["offset_y"]
+
+                        self._set(state="觸發中")
+                        self._log(f"命中 (分數 {score:.3f}) → 點擊 ({cx}, {cy})")
+                        self._do_action(cx, cy)
+
+                        triggers += 1
+                        self._set(count=triggers)
+
+                        if c["stop_after_trigger"]:
+                            self._log("已設定觸發後停止。")
+                            break
+
+                        # --- 等待圖示消失（邊緣觸發），避免同一個目標連續觸發 ---
+                        if c["wait_disappear"]:
+                            self._set(state="等待消失")
+                            while not self.stop_event.is_set():
+                                s, _ = self._match(sct, region)
+                                self._set(score=s)
+                                if s < threshold:
+                                    break
+                                time.sleep(scan)
+
+                        # --- 冷卻 ---
+                        if cooldown > 0 and not self.stop_event.is_set():
+                            self._set(state="冷卻中")
+                            end = time.time() + cooldown
+                            while time.time() < end and not self.stop_event.is_set():
+                                time.sleep(0.05)
+
+                        wait_start = time.time()
+                        self._set(state="搜尋中")
+                    else:
+                        self._set(state="搜尋中")
+                        time.sleep(scan)
+
+        except pyautogui.FailSafeException:
+            self._log("偵測到滑鼠移至螢幕角落，已緊急停止。")
+        except Exception as e:
+            self._log(f"發生錯誤：{e}")
+        finally:
+            self._set(state="已停止")
+            self._log("監控結束。")
+            self.on_finish()
+
+
+# ===============================================================
+#  主視窗
+# ===============================================================
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title(APP_TITLE)
+        root.resizable(False, False)
+
+        self.region = None
+        self.template = None          # BGR ndarray
+        self.worker = None
+        self.status = {"state": "待命", "score": 0.0, "waited": 0.0, "count": 0}
+        self.lock = threading.Lock()
+        self.logq = queue.Queue()
+
+        self._build_ui()
+        self._register_hotkeys()
+        self._poll()
+
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._load_config(silent=True)
+
+    # ---------------- UI ----------------
+    def _build_ui(self):
+        pad = dict(padx=8, pady=4)
+        main = ttk.Frame(self.root, padding=10)
+        main.grid(row=0, column=0)
+
+        # ---- 1. 偵測範圍 ----
+        f1 = ttk.LabelFrame(main, text="1. 偵測範圍", padding=8)
+        f1.grid(row=0, column=0, sticky="ew", **pad)
+        self.lbl_region = ttk.Label(f1, text="尚未設定（預設全螢幕）", width=42)
+        self.lbl_region.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Button(f1, text="框選範圍", command=self._pick_region)\
+            .grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(f1, text="使用全螢幕", command=self._full_region)\
+            .grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        f1.columnconfigure(0, weight=1)
+        f1.columnconfigure(1, weight=1)
+
+        # ---- 2. 判定圖示 ----
+        f2 = ttk.LabelFrame(main, text="2. 判定圖示", padding=8)
+        f2.grid(row=1, column=0, sticky="ew", **pad)
+        self.canvas_tpl = tk.Canvas(f2, width=150, height=90, bg="#2b2b2b",
+                                    highlightthickness=1,
+                                    highlightbackground="#666")
+        self.canvas_tpl.grid(row=0, column=0, rowspan=3, padx=(0, 10))
+        self.canvas_tpl.create_text(75, 45, text="無圖示", fill="#888")
+
+        ttk.Button(f2, text="從畫面框選擷取", command=self._pick_template)\
+            .grid(row=0, column=1, sticky="ew")
+        ttk.Button(f2, text="載入圖片檔", command=self._load_template)\
+            .grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Button(f2, text="另存圖示", command=self._save_template)\
+            .grid(row=2, column=1, sticky="ew")
+
+        ttk.Label(f2, text="相似度閾值").grid(row=3, column=0, sticky="w",
+                                          pady=(8, 0))
+        self.var_th = tk.DoubleVar(value=0.85)
+        s = ttk.Scale(f2, from_=0.50, to=0.99, variable=self.var_th,
+                      command=lambda v: self.lbl_th.config(
+                          text=f"{self.var_th.get():.2f}"))
+        s.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        self.lbl_th = ttk.Label(f2, text="0.85", width=5)
+        self.lbl_th.grid(row=3, column=2, padx=(4, 0), pady=(8, 0))
+        f2.columnconfigure(1, weight=1)
+
+        # ---- 3. 點擊設定 ----
+        f3 = ttk.LabelFrame(main, text="3. 點擊方式", padding=8)
+        f3.grid(row=2, column=0, sticky="ew", **pad)
+
+        ttk.Label(f3, text="動作").grid(row=0, column=0, sticky="w")
+        self.var_action = tk.StringVar(value="單擊")
+        cb = ttk.Combobox(f3, textvariable=self.var_action, width=10,
+                          state="readonly",
+                          values=["單擊", "雙擊", "按住放開", "按鍵盤"])
+        cb.grid(row=0, column=1, sticky="w")
+        cb.bind("<<ComboboxSelected>>", lambda e: self._sync_action())
+
+        ttk.Label(f3, text="滑鼠鍵").grid(row=0, column=2, sticky="e", padx=(10, 2))
+        self.var_button = tk.StringVar(value="left")
+        self.cb_button = ttk.Combobox(f3, textvariable=self.var_button, width=8,
+                                      state="readonly",
+                                      values=["left", "right", "middle"])
+        self.cb_button.grid(row=0, column=3, sticky="w")
+
+        ttk.Label(f3, text="按住秒數").grid(row=1, column=0, sticky="w")
+        self.var_hold = tk.DoubleVar(value=1.0)
+        self.sp_hold = ttk.Spinbox(f3, from_=0.1, to=60, increment=0.1, width=8,
+                                   textvariable=self.var_hold)
+        self.sp_hold.grid(row=1, column=1, sticky="w")
+
+        ttk.Label(f3, text="鍵盤按鍵").grid(row=1, column=2, sticky="e", padx=(10, 2))
+        self.var_key = tk.StringVar(value="space")
+        self.en_key = ttk.Entry(f3, textvariable=self.var_key, width=10)
+        self.en_key.grid(row=1, column=3, sticky="w")
+
+        ttk.Label(f3, text="位置偏移 X").grid(row=2, column=0, sticky="w")
+        self.var_ox = tk.IntVar(value=0)
+        ttk.Spinbox(f3, from_=-2000, to=2000, width=8, textvariable=self.var_ox)\
+            .grid(row=2, column=1, sticky="w")
+        ttk.Label(f3, text="Y").grid(row=2, column=2, sticky="e", padx=(10, 2))
+        self.var_oy = tk.IntVar(value=0)
+        ttk.Spinbox(f3, from_=-2000, to=2000, width=8, textvariable=self.var_oy)\
+            .grid(row=2, column=3, sticky="w")
+
+        ttk.Label(f3, text="連點次數").grid(row=3, column=0, sticky="w")
+        self.var_count = tk.IntVar(value=1)
+        ttk.Spinbox(f3, from_=1, to=999, width=8, textvariable=self.var_count)\
+            .grid(row=3, column=1, sticky="w")
+        ttk.Label(f3, text="間隔(ms)").grid(row=3, column=2, sticky="e", padx=(10, 2))
+        self.var_cint = tk.IntVar(value=100)
+        ttk.Spinbox(f3, from_=0, to=60000, width=8, textvariable=self.var_cint)\
+            .grid(row=3, column=3, sticky="w")
+
+        self.var_jitter = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f3, text="隨機抖動座標與間隔", variable=self.var_jitter)\
+            .grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.var_restore = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f3, text="點擊後滑鼠歸位", variable=self.var_restore)\
+            .grid(row=4, column=2, columnspan=2, sticky="w", pady=(6, 0))
+
+        # ---- 4. 時序 ----
+        f4 = ttk.LabelFrame(main, text="4. 待機與時序", padding=8)
+        f4.grid(row=3, column=0, sticky="ew", **pad)
+
+        ttk.Label(f4, text="掃描間隔(ms)").grid(row=0, column=0, sticky="w")
+        self.var_scan = tk.IntVar(value=100)
+        ttk.Spinbox(f4, from_=10, to=10000, width=8, textvariable=self.var_scan)\
+            .grid(row=0, column=1, sticky="w")
+
+        ttk.Label(f4, text="觸發冷卻(秒)").grid(row=0, column=2, sticky="e", padx=(10, 2))
+        self.var_cd = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(f4, from_=0, to=3600, increment=0.5, width=8,
+                    textvariable=self.var_cd).grid(row=0, column=3, sticky="w")
+
+        ttk.Label(f4, text="逾時(秒, 0=無限)").grid(row=1, column=0, sticky="w")
+        self.var_timeout = tk.IntVar(value=0)
+        ttk.Spinbox(f4, from_=0, to=86400, width=8, textvariable=self.var_timeout)\
+            .grid(row=1, column=1, sticky="w")
+
+        self.var_disappear = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f4, text="等圖示消失才允許下次觸發",
+                        variable=self.var_disappear)\
+            .grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.var_once = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f4, text="觸發一次後停止", variable=self.var_once)\
+            .grid(row=2, column=2, columnspan=2, sticky="w", pady=(6, 0))
+
+        # ---- 5. 控制 ----
+        f5 = ttk.LabelFrame(main, text="5. 執行狀態", padding=8)
+        f5.grid(row=4, column=0, sticky="ew", **pad)
+
+        self.btn_start = ttk.Button(f5, text="▶ 開始 (F9)", command=self.start)
+        self.btn_start.grid(row=0, column=0, sticky="ew")
+        self.btn_stop = ttk.Button(f5, text="■ 停止 (F10)", command=self.stop,
+                                   state="disabled")
+        self.btn_stop.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        self.lbl_state = ttk.Label(f5, text="狀態：待命",
+                                   font=("Microsoft JhengHei", 10, "bold"))
+        self.lbl_state.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        self.pb = ttk.Progressbar(f5, maximum=1.0, length=280)
+        self.pb.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.lbl_score = ttk.Label(f5, text="即時分數：0.000    等待：0.0s    觸發：0 次")
+        self.lbl_score.grid(row=3, column=0, columnspan=2, sticky="w")
+
+        self.txt_log = tk.Text(f5, height=7, width=48, state="disabled",
+                               bg="#1e1e1e", fg="#d0d0d0",
+                               font=("Consolas", 9), wrap="word")
+        self.txt_log.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        f5.columnconfigure(0, weight=1)
+        f5.columnconfigure(1, weight=1)
+
+        # ---- 6. 設定檔 ----
+        f6 = ttk.Frame(main)
+        f6.grid(row=5, column=0, sticky="ew", **pad)
+        ttk.Button(f6, text="儲存設定", command=self._save_config)\
+            .grid(row=0, column=0, sticky="ew")
+        ttk.Button(f6, text="讀取設定", command=self._load_config)\
+            .grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        f6.columnconfigure(0, weight=1)
+        f6.columnconfigure(1, weight=1)
+
+        self._sync_action()
+
+    def _sync_action(self):
+        act = self.var_action.get()
+        self.cb_button.config(state="disabled" if act == "按鍵盤" else "readonly")
+        self.sp_hold.config(state="normal" if act == "按住放開" else "disabled")
+        self.en_key.config(state="normal" if act == "按鍵盤" else "disabled")
+
+    # ---------------- 範圍 / 模板 ----------------
+    def _pick_region(self):
+        self.root.withdraw()
+        self.root.update()
+        time.sleep(0.25)
+        region, _ = ScreenSelector(
+            self.root, "拖曳框選【偵測範圍】　　Esc 取消").select()
+        self.root.deiconify()
+        if region:
+            self.region = region
+            self.lbl_region.config(
+                text=f"({region['left']}, {region['top']})  "
+                     f"{region['width']} x {region['height']}")
+            self._log(f"偵測範圍已設定：{region}")
+
+    def _full_region(self):
+        with mss.mss() as sct:
+            m = sct.monitors[1]
+        self.region = {"left": m["left"], "top": m["top"],
+                       "width": m["width"], "height": m["height"]}
+        self.lbl_region.config(text=f"全螢幕 {m['width']} x {m['height']}")
+
+    def _pick_template(self):
+        self.root.withdraw()
+        self.root.update()
+        time.sleep(0.25)
+        _, img = ScreenSelector(
+            self.root, "拖曳框選【要偵測的圖示】　　Esc 取消").select()
+        self.root.deiconify()
+        if img is not None:
+            self.template = img
+            self._show_template()
+            self._log(f"已擷取圖示：{img.shape[1]} x {img.shape[0]} px")
+
+    def _load_template(self):
+        path = filedialog.askopenfilename(
+            title="選擇判定圖示",
+            filetypes=[("圖片", "*.png;*.jpg;*.jpeg;*.bmp"), ("全部", "*.*")])
+        if not path:
+            return
+        img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            messagebox.showerror(APP_TITLE, "無法讀取這個圖片檔。")
+            return
+        self.template = img
+        self._show_template()
+        self._log(f"已載入圖示：{os.path.basename(path)}")
+        messagebox.showinfo(
+            APP_TITLE,
+            "提醒：載入的圖片必須與目前螢幕的解析度、DPI 縮放完全一致，\n"
+            "否則比對分數會偏低。若找不到目標，建議改用「從畫面框選擷取」。")
+
+    def _save_template(self):
+        if self.template is None:
+            messagebox.showwarning(APP_TITLE, "目前沒有圖示可以儲存。")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png", initialfile=TEMPLATE_FILE,
+            filetypes=[("PNG", "*.png")])
+        if path:
+            cv2.imencode(".png", self.template)[1].tofile(path)
+            self._log(f"圖示已儲存：{path}")
+
+    def _show_template(self):
+        self.canvas_tpl.delete("all")
+        h, w = self.template.shape[:2]
+        scale = min(150 / w, 90 / h, 1.0)
+        disp = cv2.resize(self.template, (max(1, int(w * scale)),
+                                          max(1, int(h * scale))))
+        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+        self._tpl_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.canvas_tpl.create_image(75, 45, image=self._tpl_photo)
+
+    # ---------------- 執行 ----------------
+    def _collect_cfg(self):
+        if self.region is None:
+            self._full_region()
+        return {
+            "region": self.region,
+            "threshold": round(self.var_th.get(), 3),
+            "action": self.var_action.get(),
+            "button": self.var_button.get(),
+            "hold_sec": self.var_hold.get(),
+            "key": self.var_key.get(),
+            "offset_x": self.var_ox.get(),
+            "offset_y": self.var_oy.get(),
+            "click_count": self.var_count.get(),
+            "click_interval": self.var_cint.get(),
+            "jitter": self.var_jitter.get(),
+            "restore_mouse": self.var_restore.get(),
+            "scan_interval": self.var_scan.get(),
+            "cooldown": self.var_cd.get(),
+            "timeout": self.var_timeout.get(),
+            "wait_disappear": self.var_disappear.get(),
+            "stop_after_trigger": self.var_once.get(),
+        }
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        if self.template is None:
+            messagebox.showwarning(APP_TITLE, "請先設定判定圖示。")
+            return
+
+        cfg = self._collect_cfg()
+        th, tw = self.template.shape[:2]
+        if th > cfg["region"]["height"] or tw > cfg["region"]["width"]:
+            messagebox.showerror(
+                APP_TITLE, "判定圖示比偵測範圍還大，請重新設定範圍。")
+            return
+
+        self.worker = ClickWorker(cfg, self.template, self.status,
+                                  self.lock, self.logq, self._on_worker_done)
+        self.worker.start()
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+
+    def stop(self):
+        if self.worker and self.worker.is_alive():
+            self.worker.stop()
+
+    def _on_worker_done(self):
+        self.root.after(0, lambda: (self.btn_start.config(state="normal"),
+                                    self.btn_stop.config(state="disabled")))
+
+    # ---------------- 熱鍵 / 輪詢 ----------------
+    def _register_hotkeys(self):
+        if not HAS_KEYBOARD:
+            self._log("未安裝 keyboard 套件，全域熱鍵停用（仍可用按鈕操作）。")
+            return
+        try:
+            keyboard.add_hotkey("f9", lambda: self.root.after(0, self.start))
+            keyboard.add_hotkey("f10", lambda: self.root.after(0, self.stop))
+            self._log("熱鍵已註冊：F9 開始 / F10 停止。")
+        except Exception as e:
+            self._log(f"熱鍵註冊失敗（可能需要系統管理員權限）：{e}")
+
+    def _poll(self):
+        with self.lock:
+            st = dict(self.status)
+        self.lbl_state.config(text=f"狀態：{st['state']}")
+        self.pb["value"] = max(0.0, st["score"])
+        self.lbl_score.config(
+            text=f"即時分數：{st['score']:.3f}    "
+                 f"閾值：{self.var_th.get():.2f}    "
+                 f"等待：{st['waited']:.1f}s    觸發：{st['count']} 次")
+
+        while not self.logq.empty():
+            self._log(self.logq.get_nowait(), stamped=True)
+
+        self.root.after(120, self._poll)
+
+    def _log(self, msg, stamped=False):
+        line = msg if stamped else f"[{time.strftime('%H:%M:%S')}] {msg}"
+        self.txt_log.config(state="normal")
+        self.txt_log.insert("end", line + "\n")
+        self.txt_log.see("end")
+        self.txt_log.config(state="disabled")
+
+    # ---------------- 設定檔 ----------------
+    def _save_config(self):
+        cfg = self._collect_cfg()
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            if self.template is not None:
+                cv2.imencode(".png", self.template)[1].tofile(TEMPLATE_FILE)
+            self._log(f"設定已儲存至 {CONFIG_FILE}")
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"儲存失敗：{e}")
+
+    def _load_config(self, silent=False):
+        if not os.path.exists(CONFIG_FILE):
+            if not silent:
+                messagebox.showinfo(APP_TITLE, "找不到設定檔。")
+            return
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                c = json.load(f)
+            self.region = c.get("region")
+            if self.region:
+                self.lbl_region.config(
+                    text=f"({self.region['left']}, {self.region['top']})  "
+                         f"{self.region['width']} x {self.region['height']}")
+            self.var_th.set(c.get("threshold", 0.85))
+            self.lbl_th.config(text=f"{self.var_th.get():.2f}")
+            self.var_action.set(c.get("action", "單擊"))
+            self.var_button.set(c.get("button", "left"))
+            self.var_hold.set(c.get("hold_sec", 1.0))
+            self.var_key.set(c.get("key", "space"))
+            self.var_ox.set(c.get("offset_x", 0))
+            self.var_oy.set(c.get("offset_y", 0))
+            self.var_count.set(c.get("click_count", 1))
+            self.var_cint.set(c.get("click_interval", 100))
+            self.var_jitter.set(c.get("jitter", True))
+            self.var_restore.set(c.get("restore_mouse", False))
+            self.var_scan.set(c.get("scan_interval", 100))
+            self.var_cd.set(c.get("cooldown", 1.0))
+            self.var_timeout.set(c.get("timeout", 0))
+            self.var_disappear.set(c.get("wait_disappear", True))
+            self.var_once.set(c.get("stop_after_trigger", False))
+            self._sync_action()
+
+            if os.path.exists(TEMPLATE_FILE):
+                img = cv2.imdecode(np.fromfile(TEMPLATE_FILE, dtype=np.uint8),
+                                   cv2.IMREAD_COLOR)
+                if img is not None:
+                    self.template = img
+                    self._show_template()
+            self._log("已載入上次的設定。")
+        except Exception as e:
+            if not silent:
+                messagebox.showerror(APP_TITLE, f"讀取失敗：{e}")
+
+    def _on_close(self):
+        self.stop()
+        time.sleep(0.15)
+        if HAS_KEYBOARD:
+            try:
+                keyboard.unhook_all_hotkeys()
+            except Exception:
+                pass
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    try:
+        style = ttk.Style()
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+    except Exception:
+        pass
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
